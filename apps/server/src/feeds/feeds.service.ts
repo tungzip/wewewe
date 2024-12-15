@@ -8,6 +8,8 @@ import { Article, Feed as FeedInfo } from '@prisma/client';
 import { ConfigurationType } from '@server/configuration';
 import { Feed, Item } from 'feed';
 import got, { Got } from 'got';
+import { load } from 'cheerio';
+import { minify } from 'html-minifier';
 import { LRUCache } from 'lru-cache';
 import pMap from '@cjs-exporter/p-map';
 
@@ -76,10 +78,19 @@ export class FeedsService {
     });
     this.logger.debug('feeds length:' + feeds.length);
 
+    const updateDelayTime =
+      this.configService.get<ConfigurationType['feed']>(
+        'feed',
+      )!.updateDelayTime;
+
     for (const feed of feeds) {
       this.logger.debug('feed', feed.id);
       try {
         await this.trpcService.refreshMpArticlesAndUpdateFeed(feed.id);
+
+        await new Promise((resolve) =>
+          setTimeout(resolve, updateDelayTime * 1e3),
+        );
       } catch (err) {
         this.logger.error('handleUpdateFeedsCron error', err);
       } finally {
@@ -89,8 +100,36 @@ export class FeedsService {
     }
   }
 
+  async cleanHtml(source: string) {
+    const $ = load(source, { decodeEntities: false });
+
+    const dirtyHtml = $.html($('.rich_media_content'));
+
+    const html = dirtyHtml
+      .replace(/data-src=/g, 'src=')
+      .replace(/opacity: 0( !important)?;/g, '')
+      .replace(/visibility: hidden;/g, '');
+
+    const content =
+      '<style> .rich_media_content {overflow: hidden;color: #222;font-size: 17px;word-wrap: break-word;-webkit-hyphens: auto;-ms-hyphens: auto;hyphens: auto;text-align: justify;position: relative;z-index: 0;}.rich_media_content {font-size: 18px;}</style>' +
+      html;
+
+    const result = minify(content, {
+      removeAttributeQuotes: true,
+      collapseWhitespace: true,
+    });
+
+    return result;
+  }
+
   async getHtmlByUrl(url: string) {
     const html = await this.request(url, { responseType: 'text' }).text();
+    if (
+      this.configService.get<ConfigurationType['feed']>('feed')!.enableCleanHtml
+    ) {
+      const result = await this.cleanHtml(html);
+      return result;
+    }
 
     return html;
   }
@@ -164,7 +203,7 @@ export class FeedsService {
       const mpName = feeds.find((item) => item.id === mpId)?.mpName || '-';
       const published = new Date(publishTime * 1e3);
 
-      let content;
+      let content = '';
       if (enableFullText) {
         content = await this.tryGetContent(id);
       }
@@ -190,6 +229,7 @@ export class FeedsService {
     id,
     type,
     limit,
+    page,
     mode,
     title_include,
     title_exclude,
@@ -197,6 +237,7 @@ export class FeedsService {
     id?: string;
     type: string;
     limit: number;
+    page: number;
     mode?: string;
     title_include?: string;
     title_exclude?: string;
@@ -220,11 +261,13 @@ export class FeedsService {
         where: { mpId: id },
         orderBy: { publishTime: 'desc' },
         take: limit,
+        skip: (page - 1) * limit,
       });
     } else {
       articles = await this.prismaService.article.findMany({
         orderBy: { publishTime: 'desc' },
         take: limit,
+        skip: (page - 1) * limit,
       });
 
       const { originUrl } =
@@ -239,6 +282,7 @@ export class FeedsService {
         status: 1,
         syncTime: 0,
         updateTime: Math.floor(Date.now() / 1e3),
+        hasHistory: -1,
         createdAt: new Date(),
         updatedAt: new Date(),
       };
